@@ -147,19 +147,20 @@ func (s *Server) handleConnection(conn net.Conn) {
 		stream, ok := streams[streamID]
 		if !ok {
 			// New stream - connect to the target specified in first frame
-			// First frame for a stream contains: [targetLen:2][targetAddr]
+			// First frame for a stream contains: [targetLen:2][targetAddr][extraData...]
 			if len(frameData) < 2 {
 				streamsMu.Unlock()
 				log.Printf("[server] new stream frame too short")
 				continue
 			}
 			targetLen := binary.BigEndian.Uint16(frameData[0:2])
-			targetAddr := string(frameData[2:])
-			if int(targetLen) != len(targetAddr) {
+			if len(frameData) < int(2+targetLen) {
 				streamsMu.Unlock()
-				log.Printf("[server] target address length mismatch")
+				log.Printf("[server] target address truncated")
 				continue
 			}
+			targetAddr := string(frameData[2 : 2+targetLen])
+			extraData := frameData[2+targetLen:] // data after the address
 
 			log.Printf("[server] new stream %d to %s", streamID, targetAddr)
 			stream, err = net.DialTimeout("tcp", targetAddr, 10*time.Second)
@@ -173,6 +174,15 @@ func (s *Server) handleConnection(conn net.Conn) {
 
 			// Read from target and send back
 			go s.proxyTargetToClient(stream, streamID, conn, sched, sessionKey)
+
+			// Write any extra data that followed the address
+			if len(extraData) > 0 {
+				stream.SetWriteDeadline(time.Now().Add(30 * time.Second))
+				if _, err := stream.Write(extraData); err != nil {
+					log.Printf("[server] write extra data to stream %d: %v", streamID, err)
+				}
+			}
+			continue // done processing this frame
 		} else {
 			streamsMu.Unlock()
 		}
@@ -559,11 +569,8 @@ func (c *Client) handleSocks(local net.Conn) {
 				return
 			}
 
-			expectedType := sched.Next()
-			if mt != expectedType {
-				log.Printf("[client] morph type mismatch: expected %s got %s", expectedType, mt)
-				continue
-			}
+			_ = sched.Next() // advance schedule (sender may have skipped types)
+			// Use the type from the wire directly
 
 			payload, err := protocol.ExtractPayload(mt, data)
 			if err != nil {
