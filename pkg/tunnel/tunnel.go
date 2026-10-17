@@ -369,27 +369,100 @@ func (c *Client) Run() error {
 func (c *Client) handleSocks(local net.Conn) {
 	defer local.Close()
 
-	// Simple address extraction from SOCKS5 or direct connect
-	// For simplicity, we read the destination address as:
-	// [addrLen:2][addr]
-	// In practice, full SOCKS5 would be implemented here
+	// ── SOCKS5 handshake ──
+	// Read: [VER:1][NMETHODS:1][METHODS:NMETHODS]
 	local.SetReadDeadline(time.Now().Add(10 * time.Second))
-	lenBuf := make([]byte, 2)
-	if _, err := io.ReadFull(local, lenBuf); err != nil {
-		log.Printf("[client] read addr len: %v", err)
+	header := make([]byte, 2)
+	if _, err := io.ReadFull(local, header); err != nil {
+		log.Printf("[client] socks handshake read: %v", err)
 		return
 	}
-	addrLen := binary.BigEndian.Uint16(lenBuf)
-	if addrLen > 256 {
-		log.Printf("[client] address too long: %d", addrLen)
+	if header[0] != 0x05 {
+		log.Printf("[client] not SOCKS5: ver=%d", header[0])
 		return
 	}
-	addrBuf := make([]byte, addrLen)
-	if _, err := io.ReadFull(local, addrBuf); err != nil {
-		log.Printf("[client] read addr: %v", err)
+	nmethods := int(header[1])
+	methods := make([]byte, nmethods)
+	if _, err := io.ReadFull(local, methods); err != nil {
+		log.Printf("[client] socks methods read: %v", err)
 		return
 	}
-	targetAddr := string(addrBuf)
+	// Respond: no auth required
+	if _, err := local.Write([]byte{0x05, 0x00}); err != nil {
+		log.Printf("[client] socks handshake write: %v", err)
+		return
+	}
+
+	// ── SOCKS5 request ──
+	// Read: [VER:1][CMD:1][RSV:1][ATYP:1][DST...]
+	reqHeader := make([]byte, 4)
+	if _, err := io.ReadFull(local, reqHeader); err != nil {
+		log.Printf("[client] socks request read: %v", err)
+		return
+	}
+	if reqHeader[0] != 0x05 {
+		log.Printf("[client] bad socks ver in request: %d", reqHeader[0])
+		return
+	}
+	cmd := reqHeader[1]
+	if cmd != 0x01 { // CONNECT only
+		log.Printf("[client] unsupported SOCKS5 command: %d", cmd)
+		local.Write([]byte{0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0}) // CMD not supported
+		return
+	}
+
+	var targetAddr string
+	atyp := reqHeader[3]
+	switch atyp {
+	case 0x01: // IPv4
+		addr := make([]byte, 4)
+		if _, err := io.ReadFull(local, addr); err != nil {
+			log.Printf("[client] socks ipv4 read: %v", err)
+			return
+		}
+		port := make([]byte, 2)
+		if _, err := io.ReadFull(local, port); err != nil {
+			log.Printf("[client] socks port read: %v", err)
+			return
+		}
+		targetAddr = fmt.Sprintf("%d.%d.%d.%d:%d", addr[0], addr[1], addr[2], addr[3],
+			binary.BigEndian.Uint16(port))
+	case 0x03: // Domain name
+		lenBuf := make([]byte, 1)
+		if _, err := io.ReadFull(local, lenBuf); err != nil {
+			log.Printf("[client] socks domain len read: %v", err)
+			return
+		}
+		domain := make([]byte, lenBuf[0])
+		if _, err := io.ReadFull(local, domain); err != nil {
+			log.Printf("[client] socks domain read: %v", err)
+			return
+		}
+		port := make([]byte, 2)
+		if _, err := io.ReadFull(local, port); err != nil {
+			log.Printf("[client] socks port read: %v", err)
+			return
+		}
+		targetAddr = fmt.Sprintf("%s:%d", string(domain), binary.BigEndian.Uint16(port))
+	case 0x04: // IPV6
+		addr := make([]byte, 16)
+		if _, err := io.ReadFull(local, addr); err != nil {
+			log.Printf("[client] socks ipv6 read: %v", err)
+			return
+		}
+		port := make([]byte, 2)
+		if _, err := io.ReadFull(local, port); err != nil {
+			log.Printf("[client] socks port read: %v", err)
+			return
+		}
+		targetAddr = fmt.Sprintf("[%s]:%d", net.IP(addr).String(), binary.BigEndian.Uint16(port))
+	default:
+		log.Printf("[client] unsupported SOCKS5 ATYP: %d", atyp)
+		local.Write([]byte{0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		return
+	}
+
+	local.SetDeadline(time.Time{})
 
 	log.Printf("[client] new proxy request to %s", targetAddr)
 
@@ -397,6 +470,8 @@ func (c *Client) handleSocks(local net.Conn) {
 	server, err := net.DialTimeout("tcp", c.serverAddr, 10*time.Second)
 	if err != nil {
 		log.Printf("[client] connect server: %v", err)
+		// Send SOCKS5 error
+		local.Write([]byte{0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 		return
 	}
 	defer server.Close()
@@ -436,7 +511,7 @@ func (c *Client) handleSocks(local net.Conn) {
 	// Create per-session morph schedule (must match server)
 	sched := morph.NewSchedule(sessionKey)
 
-	// Assign stream ID (use timestamp as unique ID)
+	// Assign stream ID
 	streamID := uint32(time.Now().UnixNano() & 0xFFFFFFFF)
 
 	// Send target address as first frame
@@ -444,10 +519,13 @@ func (c *Client) handleSocks(local net.Conn) {
 	binary.BigEndian.PutUint16(targetFrame[0:2], uint16(len(targetAddr)))
 	copy(targetFrame[2:], targetAddr)
 
-	if err := c.sendFrame(server, sched, sessionKey, streamID, targetFrame, true); err != nil {
+	if err := c.sendFrame(server, sched, sessionKey, streamID, targetFrame); err != nil {
 		log.Printf("[client] send target frame: %v", err)
 		return
 	}
+
+	// Send SOCKS5 success response to local app
+	local.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 
 	// Bidirectional relay
 	var wg sync.WaitGroup
@@ -463,7 +541,7 @@ func (c *Client) handleSocks(local net.Conn) {
 			if err != nil {
 				return
 			}
-			if err := c.sendFrame(server, sched, sessionKey, streamID, buf[:n], false); err != nil {
+			if err := c.sendFrame(server, sched, sessionKey, streamID, buf[:n]); err != nil {
 				log.Printf("[client] send data frame: %v", err)
 				return
 			}
@@ -517,7 +595,7 @@ func (c *Client) handleSocks(local net.Conn) {
 	wg.Wait()
 }
 
-func (c *Client) sendFrame(conn net.Conn, sched *morph.Schedule, key []byte, streamID uint32, data []byte, isTarget bool) error {
+func (c *Client) sendFrame(conn net.Conn, sched *morph.Schedule, key []byte, streamID uint32, data []byte) error {
 	// Build frame
 	frame := make([]byte, FrameHeaderSize+len(data))
 	binary.BigEndian.PutUint32(frame[0:4], streamID)
