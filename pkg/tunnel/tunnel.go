@@ -104,13 +104,9 @@ func (s *Server) handleConnection(conn net.Conn) {
 			break
 		}
 
-		// Verify the type matches what we expected
-		expectedType := sched.Next()
-		if actualType != expectedType {
-			// Type mismatch - could be DPI injection or desync
-			log.Printf("[server] morph type mismatch: expected %s got %s", expectedType, actualType)
-			continue
-		}
+		// Type is read from the wire — use it directly (sender may skip
+		// morph types that don't fit the payload, so we just accept what we get)
+		_ = sched.Next() // advance schedule to stay roughly in sync
 
 		// Extract the payload
 		payload, err := protocol.ExtractPayload(actualType, data)
@@ -305,13 +301,19 @@ func (s *Server) proxyTargetToClient(target net.Conn, streamID uint32, client ne
 			break
 		}
 
-		// Get next morph type
-		mt := sched.Next()
-
-		// Build morphed packet
-		pkt, err := protocol.BuildPacket(mt, sealed)
-		if err != nil {
-			log.Printf("[server] build packet: %v", err)
+		// Try morph types until one fits
+		var pkt *protocol.Packet
+		var mt protocol.MorphType
+		maxTries := int(protocol.MorphCount) * 2
+		for tries := 0; tries < maxTries; tries++ {
+			mt = sched.Next()
+			pkt, err = protocol.BuildPacket(mt, sealed)
+			if err == nil {
+				break
+			}
+		}
+		if pkt == nil {
+			log.Printf("[server] no morph type fits payload of %d bytes", len(sealed))
 			break
 		}
 
@@ -608,13 +610,20 @@ func (c *Client) sendFrame(conn net.Conn, sched *morph.Schedule, key []byte, str
 		return fmt.Errorf("seal: %w", err)
 	}
 
-	// Get next morph type
-	mt := sched.Next()
-
-	// Build morphed packet
-	pkt, err := protocol.BuildPacket(mt, sealed)
-	if err != nil {
-		return fmt.Errorf("build packet: %w", err)
+	// Try morph types until one fits the payload
+	var pkt *protocol.Packet
+	var mt protocol.MorphType
+	maxTries := int(protocol.MorphCount) * 2
+	for tries := 0; tries < maxTries; tries++ {
+		mt = sched.Next()
+		pkt, err = protocol.BuildPacket(mt, sealed)
+		if err == nil {
+			break
+		}
+		// Payload too large for this morph type — skip and try next
+	}
+	if pkt == nil {
+		return fmt.Errorf("no morph type fits payload of %d bytes after %d tries", len(sealed), maxTries)
 	}
 
 	// Send: [type:1][len:2][data]
